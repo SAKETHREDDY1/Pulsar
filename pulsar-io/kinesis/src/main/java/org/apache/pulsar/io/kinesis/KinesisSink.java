@@ -35,18 +35,26 @@ import com.google.common.util.concurrent.ListenableFuture;
 
 import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
-
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.builder.ReflectionToStringBuilder;
 import org.apache.commons.lang3.builder.ToStringStyle;
+import org.apache.pulsar.client.api.schema.GenericObject;
 import org.apache.pulsar.functions.api.Record;
 import org.apache.pulsar.io.aws.AbstractAwsConnector;
 import org.apache.pulsar.io.aws.AwsCredentialProviderPlugin;
@@ -90,7 +98,7 @@ import org.slf4j.LoggerFactory;
     help = "A sink connector that copies messages from Pulsar to Kinesis",
     configClass = KinesisSinkConfig.class
 )
-public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
+public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObject> {
 
     private static final Logger LOG = LoggerFactory.getLogger(KinesisSink.class);
 
@@ -101,6 +109,7 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
     private static final int maxPartitionedKeyLength = 256;
     private SinkContext sinkContext;
     private ScheduledExecutorService scheduledExecutor;
+    private ObjectMapper objectMapper;
     //
     private static final int FALSE = 0;
     private static final int TRUE = 1;
@@ -112,7 +121,10 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
     public static final String METRICS_TOTAL_INCOMING_BYTES = "_kinesis_total_incoming_bytes_";
     public static final String METRICS_TOTAL_SUCCESS = "_kinesis_total_success_";
     public static final String METRICS_TOTAL_FAILURE = "_kinesis_total_failure_";
-
+    
+    public static final String S3 = "S3";
+    public static final String KINESIS_STREAM = "KINESIS_STREAM";
+   
     private void sendUserRecord(ProducerSendCallback producerSendCallback) {
         ListenableFuture<UserRecordResult> addRecordResult = kinesisProducer.addUserRecord(this.streamName,
                 producerSendCallback.partitionedKey, producerSendCallback.data);
@@ -120,7 +132,7 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
     }
 
     @Override
-    public void write(Record<byte[]> record) throws Exception {
+    public void write(Record<GenericObject> record) throws Exception {
         // kpl-thread captures publish-failure. fail the publish on main pulsar-io-thread to maintain the ordering
         if (kinesisSinkConfig.isRetainOrdering() && previousPublishFailed == TRUE) {
             LOG.warn("Skip acking message to retain ordering with previous failed message {}-{}", this.streamName,
@@ -132,18 +144,23 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
                 ? partitionedKey.substring(0, maxPartitionedKeyLength - 1)
                 : partitionedKey; // partitionedKey Length must be at least one, and at most 256
         ByteBuffer data = createKinesisMessage(kinesisSinkConfig.getMessageFormat(), record);
-        sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
+        int size = data.remaining();
+        if (kinesisSinkConfig.getPipelineoption().toString() == KINESIS_STREAM) {
+        	sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
+        } else {
+        	putRecordtoS3(Long.toString(System.nanoTime()),kinesisSinkConfig.getBucketName(),data);
+        }
         if (sinkContext != null) {
             sinkContext.recordMetric(METRICS_TOTAL_INCOMING, 1);
             sinkContext.recordMetric(METRICS_TOTAL_INCOMING_BYTES, data.array().length);
         }
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Published message to kinesis stream {} with size {}", streamName, record.getValue().length);
+            LOG.debug("Published message to kinesis stream {} with size {}", streamName, size);
         }
     }
 
     @Override
-    public void close() throws IOException {
+    public void close() {
         if (kinesisProducer != null) {
             kinesisProducer.flush();
             kinesisProducer.destroy();
@@ -152,23 +169,30 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
     }
 
     @Override
-    public void open(Map<String, Object> config, SinkContext sinkContext) throws Exception {
+    public void open(Map<String, Object> config, SinkContext sinkContext) {
         scheduledExecutor = Executors.newSingleThreadScheduledExecutor();
         kinesisSinkConfig = IOConfigUtils.loadWithSecrets(config, KinesisSinkConfig.class, sinkContext);
         this.sinkContext = sinkContext;
 
         checkArgument(isNotBlank(kinesisSinkConfig.getAwsKinesisStreamName()), "empty kinesis-stream name");
-        checkArgument(isNotBlank(kinesisSinkConfig.getAwsEndpoint()) ||
-                      isNotBlank(kinesisSinkConfig.getAwsRegion()),
+        checkArgument(isNotBlank(kinesisSinkConfig.getAwsEndpoint())
+                        || isNotBlank(kinesisSinkConfig.getAwsRegion()),
                       "Either the aws-end-point or aws-region must be set");
         checkArgument(isNotBlank(kinesisSinkConfig.getAwsCredentialPluginParam()), "empty aws-credential param");
 
         KinesisProducerConfiguration kinesisConfig = new KinesisProducerConfiguration();
         kinesisConfig.setKinesisEndpoint(kinesisSinkConfig.getAwsEndpoint());
+        if (kinesisSinkConfig.getAwsEndpointPort() != null) {
+            kinesisConfig.setKinesisPort(kinesisSinkConfig.getAwsEndpointPort());
+        }
         kinesisConfig.setRegion(kinesisSinkConfig.getAwsRegion());
         kinesisConfig.setThreadingModel(ThreadingModel.POOLED);
         kinesisConfig.setThreadPoolSize(4);
         kinesisConfig.setCollectionMaxCount(1);
+        if (kinesisSinkConfig.getSkipCertificateValidation() != null
+                && kinesisSinkConfig.getSkipCertificateValidation()) {
+            kinesisConfig.setVerifyCertificate(false);
+        }
         AWSCredentialsProvider credentialsProvider = createCredentialProvider(
                 kinesisSinkConfig.getAwsCredentialPluginName(),
                 kinesisSinkConfig.getAwsCredentialPluginParam())
@@ -177,14 +201,19 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
 
         this.streamName = kinesisSinkConfig.getAwsKinesisStreamName();
         this.kinesisProducer = new KinesisProducer(kinesisConfig);
+        this.objectMapper = new ObjectMapper();
+        if (kinesisSinkConfig.isJsonIncludeNonNulls()) {
+            objectMapper.setSerializationInclusion(JsonInclude.Include.NON_NULL);
+        }
         IS_PUBLISH_FAILED.set(this, FALSE);
 
-        LOG.info("Kinesis sink started. {}", (ReflectionToStringBuilder.toString(kinesisConfig, ToStringStyle.SHORT_PREFIX_STYLE)));
+        LOG.info("Kinesis sink started. {}",
+                ReflectionToStringBuilder.toString(kinesisConfig, ToStringStyle.SHORT_PREFIX_STYLE));
     }
 
     private static final class ProducerSendCallback implements FutureCallback<UserRecordResult> {
 
-        private Record<byte[]> resultContext;
+        private Record<GenericObject> resultContext;
         private long startTime = 0;
         private final Handle<ProducerSendCallback> recyclerHandle;
         private KinesisSink kinesisSink;
@@ -196,7 +225,8 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
             this.recyclerHandle = recyclerHandle;
         }
 
-        static ProducerSendCallback create(KinesisSink kinesisSink, Record<byte[]> resultContext, long startTime, String partitionedKey, ByteBuffer data) {
+        static ProducerSendCallback create(KinesisSink kinesisSink, Record<GenericObject> resultContext, long startTime,
+                                           String partitionedKey, ByteBuffer data) {
             ProducerSendCallback sendCallback = RECYCLER.get();
             sendCallback.resultContext = resultContext;
             sendCallback.kinesisSink = kinesisSink;
@@ -204,8 +234,9 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
             sendCallback.partitionedKey = partitionedKey;
             sendCallback.data = data;
             if (kinesisSink.kinesisSinkConfig.isRetainOrdering() && sendCallback.backoff == null) {
-                sendCallback.backoff = new Backoff(kinesisSink.kinesisSinkConfig.getRetryInitialDelayInMillis(), TimeUnit.MILLISECONDS,
-                        kinesisSink.kinesisSinkConfig.getRetryMaxDelayInMillis(), TimeUnit.MILLISECONDS, 0, TimeUnit.SECONDS);
+                sendCallback.backoff = new Backoff(kinesisSink.kinesisSinkConfig.getRetryInitialDelayInMillis(),
+                        TimeUnit.MILLISECONDS, kinesisSink.kinesisSinkConfig.getRetryMaxDelayInMillis(),
+                        TimeUnit.MILLISECONDS, 0, TimeUnit.SECONDS);
             }
             return sendCallback;
         }
@@ -214,8 +245,9 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
             resultContext = null;
             kinesisSink = null;
             startTime = 0;
-            if (backoff != null)
+            if (backoff != null) {
                 backoff.reset();
+            }
             partitionedKey = null;
             data = null;
             recyclerHandle.recycle(this);
@@ -231,7 +263,8 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
         @Override
         public void onSuccess(UserRecordResult result) {
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Successfully published message for {}-{} with latency {}", kinesisSink.streamName, result.getShardId(),
+                LOG.debug("Successfully published message for {}-{} with latency {}",
+                        kinesisSink.streamName, result.getShardId(),
                         TimeUnit.NANOSECONDS.toMillis((System.nanoTime() - startTime)));
             }
             if (kinesisSink.sinkContext != null) {
@@ -251,8 +284,9 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
                 failedException.getResult().getAttempts().forEach(attempt ->
                         stringBuffer.append(String.format("errorMessage:%s, errorCode:%s, delay:%d, duration:%d;",
                                 attempt.getErrorMessage(), attempt.getErrorCode(), attempt.getDelay(), attempt.getDuration())));
-                LOG.error("[{}] Failed to published message for replicator of {}-{}: Attempts:{}", kinesisSink.streamName,
-                        resultContext.getPartitionId(), resultContext.getRecordSequence(), stringBuffer.toString());
+                LOG.error("[{}] Failed to published message for replicator of {}-{}: Attempts:{}",
+                        kinesisSink.streamName, resultContext.getPartitionId(),
+                        resultContext.getRecordSequence(), stringBuffer);
             } else {
                 if (StringUtils.isEmpty(exception.getMessage())) {
                     LOG.error("[{}] Failed to published message for replicator of {}-{}", kinesisSink.streamName,
@@ -270,22 +304,46 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<byte[]> {
                 long nextDelay = backoff.next();
                 LOG.info("[{}] Retry to publish message for replicator of {}-{} after {} ms.", kinesisSink.streamName,
                         resultContext.getPartitionId(), resultContext.getRecordSequence(), nextDelay);
-                kinesisSink.scheduledExecutor.schedule(() -> kinesisSink.sendUserRecord(this), nextDelay, TimeUnit.MICROSECONDS);
+                kinesisSink.scheduledExecutor.schedule(() -> kinesisSink.sendUserRecord(this),
+                        nextDelay, TimeUnit.MICROSECONDS);
             } else {
                 recycle();
             }
         }
     }
 
-    public static ByteBuffer createKinesisMessage(MessageFormat msgFormat, Record<byte[]> record) {
-        if (MessageFormat.FULL_MESSAGE_IN_JSON.equals(msgFormat)) {
-            return ByteBuffer.wrap(Utils.serializeRecordToJson(record).getBytes());
-        } else if (MessageFormat.FULL_MESSAGE_IN_FB.equals(msgFormat)) {
-            return Utils.serializeRecordToFlatBuffer(record);
-        } else {
-            // send raw-message
-            return ByteBuffer.wrap(record.getValue());
+    public ByteBuffer createKinesisMessage(MessageFormat msgFormat, Record<GenericObject> record)
+            throws JsonProcessingException {
+        switch (msgFormat) {
+            case FULL_MESSAGE_IN_JSON:
+                return ByteBuffer.wrap(Utils.serializeRecordToJson(record).getBytes(StandardCharsets.UTF_8));
+            case FULL_MESSAGE_IN_FB:
+                return Utils.serializeRecordToFlatBuffer(record);
+            case FULL_MESSAGE_IN_JSON_EXPAND_VALUE:
+                return ByteBuffer.wrap(Utils.serializeRecordToJsonExpandingValue(objectMapper, record)
+                        .getBytes(StandardCharsets.UTF_8));
+            default:
+                // send raw-message
+                return ByteBuffer.wrap(Utils.getMessage(record).getData());
         }
+    }
+    
+    public void putRecordtoS3(String KeyName, String bucketName,ByteBuffer bytebuffer) {
+		Region region = Region.US_EAST_1;
+		S3Client s3 = S3Client.builder()
+                .region(region)
+                .build();
+
+        PutObjectRequest objectRequest = PutObjectRequest.builder()
+                .bucket(bucketName)
+                .key(KeyName)
+                .build();
+        try{
+        	s3.putObject(objectRequest, RequestBody.fromByteBuffer(bytebuffer));
+        }catch(Exception e) {
+        	System.out.println(e);
+        }
+        
     }
 
 }

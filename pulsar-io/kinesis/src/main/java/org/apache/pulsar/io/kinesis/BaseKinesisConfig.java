@@ -67,7 +67,21 @@ public abstract class BaseKinesisConfig implements Serializable {
         sensitive = true,
         help = "json-parameters to initialize `AwsCredentialsProviderPlugin`")
     private String awsCredentialPluginParam = "";
-
+    
+    @FieldDoc(
+            required = true,
+            defaultValue = "",
+            help = "s3 bucket name"
+        )
+    private String bucketName = "";
+    
+    @FieldDoc(
+            required = true,
+            defaultValue = "",
+            help = "choose selection either KINESIS_STREAM or directly to S3"
+        )
+    private String pipelineoption = "";
+    
     protected Region regionAsV2Region() {
         return Region.of(this.getAwsRegion());
     }
