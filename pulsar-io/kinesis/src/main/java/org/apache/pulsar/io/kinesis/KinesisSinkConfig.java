@@ -114,14 +114,14 @@ public class KinesisSinkConfig extends BaseKinesisConfig implements Serializable
             defaultValue = "200",
             help = "Specify the BufferSize in MB"
         )
-    private long bufferSize = 200;
+    private long bufferSize = 400;
     
     @FieldDoc(
             required = true,
             defaultValue = "50" ,
             help = "Specify the Batchsize"
         )
-    private Integer batchsize = 50;
+    private Integer batchsize = 100;
     
     @FieldDoc(
             required = false,
