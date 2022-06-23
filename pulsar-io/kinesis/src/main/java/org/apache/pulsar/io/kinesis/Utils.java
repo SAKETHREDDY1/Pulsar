@@ -25,14 +25,6 @@ import static java.util.Base64.getEncoder;
 import java.io.IOException;
 
 import com.google.gson.JsonObject;
-
-import software.amazon.awssdk.core.sync.RequestBody;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider;
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.PutObjectRequest;
-
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
@@ -70,7 +62,6 @@ public class Utils {
     private static final String UNCPRESSED_MSG_SIZE_FIELD = "uncompressedMessageSize";
     private static final String BATCH_SIZE_FIELD = "batchSize";
     private static final String ENCRYPTION_CTX_FIELD = "encryptionCtx";
-    private static final String bucketName = "p9u8l0sar-cassandra";
     private static final FlatBufferBuilder DEFAULT_FB_BUILDER = new FlatBufferBuilder(0);
 
     /**
@@ -227,9 +218,6 @@ public class Utils {
             }
             result.add(ENCRYPTION_CTX_FIELD, encryptionCtxJson);
         }
-        // To put Record to S3
-        //putRecordtoS3(record.getKey().toString(),bucketName,ByteBuffer.wrap(result.toString().getBytes(StandardCharsets.UTF_8)));
-        
         return result.toString();
     }
 
@@ -244,8 +232,6 @@ public class Utils {
         record.getTopicName().ifPresent(jsonRecord::setTopicName);
         record.getEventTime().ifPresent(jsonRecord::setEventTime);
         record.getProperties().forEach(jsonRecord::addProperty);
-//        ByteBuffer.wrap(mapper.writeValueAsString(jsonRecord).getBytes(StandardCharsets.UTF_8));
-//        putRecordtoS3(record.getKey().toString(),bucketName,ByteBuffer.wrap(mapper.writeValueAsString(jsonRecord).getBytes(StandardCharsets.UTF_8)));
         return mapper.writeValueAsString(jsonRecord);
     }
 
@@ -278,23 +264,4 @@ public class Utils {
                         + schema.getSchemaInfo().getType());
         }
     }
-    
-    private static void putRecordtoS3(String KeyName, String bucketName,ByteBuffer bytebuffer) {
-		Region region = Region.US_EAST_1;
-		S3Client s3 = S3Client.builder()
-                .region(region)
-                .build();
-
-        PutObjectRequest objectRequest = PutObjectRequest.builder()
-                .bucket(bucketName)
-                .key(KeyName)
-                .build();
-        try{
-        	s3.putObject(objectRequest, RequestBody.fromByteBuffer(bytebuffer));
-        }catch(Exception e) {
-        	System.out.println(e);
-        }
-        
-    }
-
 }

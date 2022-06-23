@@ -102,6 +102,34 @@ public class KinesisSinkConfig extends BaseKinesisConfig implements Serializable
             help = "The maximum delay(in milliseconds) between retries.")
     private long retryMaxDelayInMillis = 60000;
     
+    @FieldDoc(
+            required = true,
+            defaultValue = "",
+            help = "s3 bucket name"
+        )
+    private String bucketName = "";
+    
+    @FieldDoc(
+            required = true,
+            defaultValue = "200",
+            help = "Specify the BufferSize in MB"
+        )
+    private long bufferSize = 200;
+    
+    @FieldDoc(
+            required = true,
+            defaultValue = "50" ,
+            help = "Specify the Batchsize"
+        )
+    private Integer batchsize = 50;
+    
+    @FieldDoc(
+            required = false,
+            defaultValue = "s3",
+            help = "choose selection either KINESIS_STREAM or directly to S3"
+        )
+    private String pipelineoption = "";
+    
     public static KinesisSinkConfig load(String yamlFile) throws IOException {
         ObjectMapper mapper = new ObjectMapper(new YAMLFactory());
         return mapper.readValue(new File(yamlFile), KinesisSinkConfig.class);
@@ -143,17 +171,5 @@ public class KinesisSinkConfig extends BaseKinesisConfig implements Serializable
          */
         FULL_MESSAGE_IN_JSON_EXPAND_VALUE
     }
-    
-//    public enum Selection{
-//    	/**
-//    	 * Instead of streaming to Kinesis stream it is directly pushed to s3
-//    	 */
-//    	S3,
-//    	/**
-//    	 * Pushes the payload to kinesis stream
-//    	 */
-//    	KINESIS_STREAM
-//    	
-//    }
 
 }

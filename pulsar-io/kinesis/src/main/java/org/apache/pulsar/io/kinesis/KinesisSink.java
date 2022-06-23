@@ -30,8 +30,10 @@ import com.amazonaws.services.kinesis.producer.KinesisProducerConfiguration;
 import com.amazonaws.services.kinesis.producer.KinesisProducerConfiguration.ThreadingModel;
 import com.amazonaws.services.kinesis.producer.UserRecordFailedException;
 import com.amazonaws.services.kinesis.producer.UserRecordResult;
+import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
@@ -43,18 +45,26 @@ import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLong;
+
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.builder.ReflectionToStringBuilder;
 import org.apache.commons.lang3.builder.ToStringStyle;
+import org.apache.pulsar.client.api.Schema;
 import org.apache.pulsar.client.api.schema.GenericObject;
+import org.apache.pulsar.client.api.schema.GenericRecord;
 import org.apache.pulsar.functions.api.Record;
 import org.apache.pulsar.io.aws.AbstractAwsConnector;
 import org.apache.pulsar.io.aws.AwsCredentialProviderPlugin;
@@ -105,6 +115,7 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObj
     private KinesisProducer kinesisProducer;
     private KinesisSinkConfig kinesisSinkConfig;
     private String streamName;
+    private static String pipelineoption = "s3";
     private static final String defaultPartitionedKey = "default";
     private static final int maxPartitionedKeyLength = 256;
     private SinkContext sinkContext;
@@ -122,13 +133,46 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObj
     public static final String METRICS_TOTAL_SUCCESS = "_kinesis_total_success_";
     public static final String METRICS_TOTAL_FAILURE = "_kinesis_total_failure_";
     
-    public static final String S3 = "S3";
-    public static final String KINESIS_STREAM = "KINESIS_STREAM";
-   
+    private static final String S3 = "s3";
+    private static final String KINESIS_STREAM = "kinesisstream";
+    
+    private long maxBatchSize;
+    private final AtomicLong currentBatchSize = new AtomicLong(0L);
+    private ArrayBlockingQueue<ByteBuffer> pendingFlushQueue;
+    private final AtomicBoolean isFlushRunning = new AtomicBoolean(false);
+    
+    private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);
+    
     private void sendUserRecord(ProducerSendCallback producerSendCallback) {
         ListenableFuture<UserRecordResult> addRecordResult = kinesisProducer.addUserRecord(this.streamName,
                 producerSendCallback.partitionedKey, producerSendCallback.data);
         addCallback(addRecordResult, producerSendCallback, directExecutor());
+    }
+    
+    private ByteBuffer concatBuffers(List<ByteBuffer> bbs) {
+    	
+        long length = 0;
+        for (ByteBuffer bb : bbs) {
+            bb.rewind();
+            length += bb.remaining();
+        }
+        
+        if (length > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Buffers are too large for concatenation");
+        }
+        
+        if (length == 0) {
+            return EMPTY;
+        }
+        
+        ByteBuffer bbNew = ByteBuffer.allocateDirect((int) length);
+        for (ByteBuffer bb : bbs) {
+            bb.rewind();
+            bbNew.put(bb);
+        }
+        
+        bbNew.rewind();
+        return bbNew;
     }
 
     @Override
@@ -145,10 +189,19 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObj
                 : partitionedKey; // partitionedKey Length must be at least one, and at most 256
         ByteBuffer data = createKinesisMessage(kinesisSinkConfig.getMessageFormat(), record);
         int size = data.remaining();
-        if (kinesisSinkConfig.getPipelineoption().toString() == KINESIS_STREAM) {
-        	sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
-        } else {
-        	putRecordtoS3(Long.toString(System.nanoTime()),kinesisSinkConfig.getBucketName(),data);
+        
+        switch(pipelineoption) {
+        
+	        case KINESIS_STREAM :
+	        	sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
+	        	break;
+	        case S3 :
+	            pendingFlushQueue.put(data);
+	            currentBatchSize.addAndGet(1);
+	            flushIfNeeded(false);
+	            break;
+	        default :
+	        	sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
         }
         if (sinkContext != null) {
             sinkContext.recordMetric(METRICS_TOTAL_INCOMING, 1);
@@ -158,22 +211,75 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObj
             LOG.debug("Published message to kinesis stream {} with size {}", streamName, size);
         }
     }
+    private void unsafeFlush() {
+    	
+        final List<ByteBuffer> recordsToInsert = Lists.newArrayList();
+        while (!pendingFlushQueue.isEmpty() && recordsToInsert.size() < maxBatchSize) {
+            ByteBuffer r = pendingFlushQueue.poll();
+            if (r != null) {
+                recordsToInsert.add(r);
+            }
+        }
+        ByteBuffer batchdata = concatBuffers(recordsToInsert);
+        putRecordtoS3(Long.toString(System.nanoTime()),kinesisSinkConfig.getBucketName(),batchdata);
+        
+    }
+    
+    private void flush() {
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("flush requested, pending: {}, batchSize: {}",
+                currentBatchSize.get(), maxBatchSize);
+        }
 
-    @Override
+        if (pendingFlushQueue.isEmpty()) {
+            LOG.info("Skip flushing, because the pending flush queue is empty ...");
+            return;
+        }
+
+        if (!isFlushRunning.compareAndSet(false, true)) {
+        	LOG.info("Skip flushing, because there is an outstanding flush ...");
+            return;
+        }
+
+        try {
+            unsafeFlush();
+        } catch (Throwable t) {
+        	LOG.error("Caught unexpected exception: ", t);
+        } finally {
+            isFlushRunning.compareAndSet(true, false);
+        }
+    }
+
+    private void flushIfNeeded(boolean force) {
+        if (isFlushRunning.get()) {
+            return;
+        }
+        if (force || currentBatchSize.get() >= maxBatchSize) {
+        	scheduledExecutor.submit(this::flush);
+        }		
+	}
+
+	@Override
     public void close() {
         if (kinesisProducer != null) {
             kinesisProducer.flush();
             kinesisProducer.destroy();
         }
+        flushIfNeeded(true);
         LOG.info("Kinesis sink stopped.");
+
     }
 
     @Override
     public void open(Map<String, Object> config, SinkContext sinkContext) {
+    	
+ 
         scheduledExecutor = Executors.newSingleThreadScheduledExecutor();
         kinesisSinkConfig = IOConfigUtils.loadWithSecrets(config, KinesisSinkConfig.class, sinkContext);
         this.sinkContext = sinkContext;
-
+        
+        LOG.info("The open method is triggred" + kinesisSinkConfig.toString());
+        
         checkArgument(isNotBlank(kinesisSinkConfig.getAwsKinesisStreamName()), "empty kinesis-stream name");
         checkArgument(isNotBlank(kinesisSinkConfig.getAwsEndpoint())
                         || isNotBlank(kinesisSinkConfig.getAwsRegion()),
@@ -198,10 +304,14 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObj
                 kinesisSinkConfig.getAwsCredentialPluginParam())
             .getCredentialProvider();
         kinesisConfig.setCredentialsProvider(credentialsProvider);
-
+        
+    	maxBatchSize = kinesisSinkConfig.getBatchsize();
+    	pendingFlushQueue = new ArrayBlockingQueue<ByteBuffer>(kinesisSinkConfig.getBatchsize());
+    	
         this.streamName = kinesisSinkConfig.getAwsKinesisStreamName();
         this.kinesisProducer = new KinesisProducer(kinesisConfig);
         this.objectMapper = new ObjectMapper();
+        pipelineoption = kinesisSinkConfig.getPipelineoption();
         if (kinesisSinkConfig.isJsonIncludeNonNulls()) {
             objectMapper.setSerializationInclusion(JsonInclude.Include.NON_NULL);
         }
@@ -328,7 +438,8 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObj
         }
     }
     
-    public void putRecordtoS3(String KeyName, String bucketName,ByteBuffer bytebuffer) {
+    private void putRecordtoS3(String KeyName, String bucketName,ByteBuffer bytebuffer) {
+    	
 		Region region = Region.US_EAST_1;
 		S3Client s3 = S3Client.builder()
                 .region(region)
@@ -345,5 +456,4 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObj
         }
         
     }
-
 }
