@@ -190,20 +190,23 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObj
         ByteBuffer data = createKinesisMessage(kinesisSinkConfig.getMessageFormat(), record);
         int size = data.remaining();
         
-        
-        switch(pipelineoption) {
-        
-	        case KINESIS_STREAM :
-	        	sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
-	        	break;
-	        case S3 :
-	            pendingFlushQueue.put(data);
-	            currentBatchSize.addAndGet(1);
-	            flushIfNeeded(false);
-	            break;
-	        default :
-	        	sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
-        }
+//        
+//        switch(pipelineoption) {
+//        
+//	        case KINESIS_STREAM :
+//	        	sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
+//	        	break;
+//	        case S3 :
+//	            pendingFlushQueue.put(data);
+//	            currentBatchSize.addAndGet(1);
+//	            flushIfNeeded(false);
+//	            break;
+//	        default :
+//	        	sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
+//        }
+        pendingFlushQueue.put(data);
+        currentBatchSize.addAndGet(1);
+        flushIfNeeded(false);
         if (sinkContext != null) {
             sinkContext.recordMetric(METRICS_TOTAL_INCOMING, 1);
             sinkContext.recordMetric(METRICS_TOTAL_INCOMING_BYTES, data.array().length);
