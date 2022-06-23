@@ -189,7 +189,10 @@ public class KinesisSink extends AbstractAwsConnector implements Sink<GenericObj
                 : partitionedKey; // partitionedKey Length must be at least one, and at most 256
         ByteBuffer data = createKinesisMessage(kinesisSinkConfig.getMessageFormat(), record);
         int size = data.remaining();
+        
+        
         switch(pipelineoption) {
+        
 	        case KINESIS_STREAM :
 	        	sendUserRecord(ProducerSendCallback.create(this, record, System.nanoTime(), partitionedKey, data));
 	        	break;

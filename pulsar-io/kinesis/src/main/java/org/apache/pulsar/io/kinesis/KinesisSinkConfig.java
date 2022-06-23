@@ -114,7 +114,7 @@ public class KinesisSinkConfig extends BaseKinesisConfig implements Serializable
             defaultValue = "200",
             help = "Specify the BufferSize in MB"
         )
-    private long bufferSize = 400;
+    private long bufferSize = 200;
     
     @FieldDoc(
             required = true,
