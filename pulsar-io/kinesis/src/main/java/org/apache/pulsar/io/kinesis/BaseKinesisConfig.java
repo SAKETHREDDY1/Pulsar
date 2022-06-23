@@ -68,6 +68,7 @@ public abstract class BaseKinesisConfig implements Serializable {
         help = "json-parameters to initialize `AwsCredentialsProviderPlugin`")
     private String awsCredentialPluginParam = "";
     
+    
     protected Region regionAsV2Region() {
         return Region.of(this.getAwsRegion());
     }
